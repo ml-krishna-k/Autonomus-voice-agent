@@ -1,0 +1,10 @@
+whisper
+ffmpeg
+faster-whisper
+fastapi
+numpy
+uvicorn
+imageio-ffmpeg
+python-multipart
+requests
+python-dotenv
