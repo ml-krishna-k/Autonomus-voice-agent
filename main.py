@@ -1,265 +1,222 @@
 import os
 import sys
 import time
-from pathlib import Path
+import msvcrt
 import re
-import numpy as np
+import atexit
+from pathlib import Path
 
-# Add path to ASR module
-# ASR is located at Backend/audio-transcription/asr_service/api
-# We need to be able to import 'asr' from there.
-# If we append 'audio-transcription/asr_service/api' to sys.path, we can do `from asr.model import ...`
-current_dir = Path(__file__).resolve().parent
-asr_api_path = current_dir / "audio-transcription" / "asr_service" / "api"
-sys.path.append(str(asr_api_path))
-
-try:
-    from asr.audio import load_mp3_as_pcm
-    from asr.model import ASRModel
-    from asr.utils import segments_to_text
-except ImportError as e:
-    print(f"Error importing ASR modules: {e}")
-    sys.exit(1)
-
-from llm.llm import get_llm_response, clear_history
-from tts.tts import SherpaTTS # Using our Piper wrapper
-
-# Initialize TTS
-models_dir = os.path.join(current_dir, "models")
-tts_engine = SherpaTTS(models_dir)
-
-# Initialize ASR
-asr = ASRModel()
-MAX_AUDIO_SECONDS = 30 * 60
-
-
-def filter_thinking(text_stream):
-    in_think_block = False
-    buffer = ""
-    
-    for chunk in text_stream:
-        buffer += chunk
-        
-        while True:
-            # Check for opening tag
-            if not in_think_block:
-                start_match = re.search(r'<think>', buffer)
-                if start_match:
-                    # Yield everything before the tag
-                    pre_think = buffer[:start_match.start()]
-                    if pre_think:
-                        yield pre_think
-                    # Update buffer to start after the opening tag
-                    # But wait, looking for closing tag in the rest
-                    buffer = buffer[start_match.end():]
-                    in_think_block = True
-                else:
-                    # No opening tag found yet.
-                    # Be careful not to yield partial tag (e.g. "<th")
-                    # If buffer ends with partial tag, keep it.
-                    # Simple heuristic: if buffer contains '<', wait.
-                    if '<' in buffer:
-                        # Find the last '<'
-                        last_open = buffer.rfind('<')
-                        if last_open > 0:
-                            yield buffer[:last_open]
-                            buffer = buffer[last_open:]
-                        # If at 0, yield nothing, wait for more chunks
-                        break
-                    else:
-                        yield buffer
-                        buffer = ""
-                        break
-            
-            # Check for closing tag
-            if in_think_block:
-                end_match = re.search(r'</think>', buffer)
-                if end_match:
-                    # Found closing tag. Ignore content.
-                    # Buffer starts after the closing tag
-                    buffer = buffer[end_match.end():]
-                    in_think_block = False
-                    # Loop again to see if there is valid text or another think block
-                    continue
-                else:
-                    # No closing tag. Discard buffer (it's thinking) 
-                    # except maybe keep tail if partial closing tag?
-                    # For safety, just discard everything except potential partial closing "</"
-                    # But simpler: just clear buffer if we are deep in thought
-                    # To be robust against split tags like "</th" + "ink>", we keep a small tail
-                    if len(buffer) > 10: # Keep small context
-                         buffer = buffer[-10:] 
-                    break
-
-    # Yield remaining buffer if not in think block
-    if buffer and not in_think_block:
-        yield buffer
-
-# Simple Text Stream Segmenter
-def yield_stream_segments(text_stream):
-    buffer = ""
-    for chunk in text_stream:
-        buffer += chunk
-        while True:
-            # Check for punctuation
-            match = re.search(r'([.?!:;]+)', buffer)
-            if match:
-                end_idx = match.end()
-                sentence = buffer[:end_idx]
-                buffer = buffer[end_idx:]
-                if sentence.strip():
-                    yield sentence.strip()
-            else:
-                # Check word count if no punctuation
-                words = buffer.split()
-                if len(words) > 12: 
-                    sentence = " ".join(words[:12])
-                    buffer = " ".join(words[12:])
-                    yield sentence
-                else:
-                    break 
-    if buffer.strip():
-        yield buffer.strip()
+# Ensure paths are correct
+sys.path.append(os.path.join(os.path.dirname(__file__), "audio-transcription"))
 
 from audio.recorder import AudioRecorder
-
-def process_audio_chunk(pcm: np.ndarray):
-    """
-    Process a raw PCM audio chunk through the pipeline.
-    """
-    duration_sec = len(pcm) / 16000
-    if duration_sec < 0.5:
-        # print("Audio too short, ignoring.")
-        return
-
-    # 1. Transcription (ASR)
-    print(f"--- Processing Audio ({duration_sec:.2f}s) ---")
+# Dynamic import for ASR to handle potential path issues gracefully-ish
+try:
+    from asr_service.api.asr.model import ASRModel
+except ImportError:
     try:
-        start_time = time.time()
-        segments, info = asr.transcribe(pcm)
-        latency = time.time() - start_time
-        transcribed_text = segments_to_text(segments)
+        from asr.model import ASRModel
+    except ImportError:
+        print("Error importing ASRModel. Check paths.")
+        sys.exit(1)
+
+from tts.tts import SherpaTTS
+from llm.llm import get_llm_response, clear_history
+
+class VoiceAgent:
+    def __init__(self):
+        print("Initializing Autonomous Voice Agent...")
+        self.running = True
         
-        if not transcribed_text.strip():
-            print("No speech detected.")
-            return
-
-        # Filter common hallucinations
-        clean_text = transcribed_text.strip().lower()
-        if clean_text in ["[you]", "you", "thank you", "thanks", "mbc", "mo", "blank"]:
-             print(f"Ignored hallucination: {transcribed_text}")
-             return
-
-        print(f"Transcription Latency: {latency:.2f}s")
-        print(f"User: [{transcribed_text}]")
-    except Exception as e:
-        print(f"ASR Error: {e}")
-        return
-
-    # 2. LLM & TTS Streaming
-    full_llm_response = ""
-    try:
-        llm_stream = get_llm_response(transcribed_text)
-        filtered_stream = filter_thinking(llm_stream)
-        
-        print("Agent: ", end="", flush=True)
-        for segment in yield_stream_segments(filtered_stream):
-            print(f"{segment} ", end="", flush=True)
-            full_llm_response += segment + " "
-            
-            # Send to TTS
-            if tts_engine:
-                 tts_engine.synthesize(segment)
-            else:
-                pass
-        print() # Newline
-        
-        # Signal TTS that turn is done
-        if tts_engine:
-            tts_engine.end_turn()
-                
-    except Exception as e:
-        print(f"LLM/TTS Error: {e}")
-
-    # 3. Save Output (Optional, just logging last turn)
-    try:
-        output_file = os.path.join(current_dir, "audio-transcription", "asr_output_text.txt")
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(full_llm_response)
-    except Exception:
-        pass
-
-import msvcrt
-
-def check_quit_key():
-    """
-    Returns True if 'q' is pressed.
-    """
-    if msvcrt.kbhit():
-        key = msvcrt.getch()
+        # 1. Components
         try:
-            # Handle standard keys
-            char = key.decode('utf-8').lower()
-            if char == 'q':
+            self.recorder = AudioRecorder()
+            print("[OK] Microphone initialized.")
+            
+            self.asr_model = ASRModel()
+            print("[OK] ASR Model loaded.")
+            
+            models_dir = os.path.join(os.path.dirname(__file__), "models")
+            self.tts = SherpaTTS(models_dir)
+            print("[OK] TTS System initialized.")
+            
+        except Exception as e:
+            print(f"[CRITICAL] Initialization failed: {e}")
+            sys.exit(1)
+            
+        # State
+        self.response_buffer = ""
+        self.in_think_block = False
+        self.filter_buffer = ""
+
+        # Register cleanup
+        atexit.register(self.cleanup)
+
+    def cleanup(self):
+        """Cleanup resources on exit."""
+        print("\nCleaning up resources...")
+        try:
+            clear_history() 
+            if hasattr(self, 'tts'):
+                self.tts.stop()
+        except:
+            pass
+
+    def check_quit(self):
+        """Check for 'q' key."""
+        if msvcrt.kbhit():
+            key = msvcrt.getch()
+            if key.lower() == b'q':
+                self.running = False
                 return True
-        except UnicodeDecodeError:
-            pass # Ignore special keys
-    return False
+        return False
 
-def run_live_loop():
-    print("Initializing Microphone...")
-    recorder = AudioRecorder()
-    
-    # Reset history at startup
-    clear_history()
-    
-    # Initial Greeting
-    greeting_text = "Hello, How can i assit u today"
-    print(f"Agent: {greeting_text}")
-    if tts_engine:
-        tts_engine.synthesize(greeting_text)
-        tts_engine.end_turn()
-
-    print("System Ready. Start speaking...")
-    print(">> Press and hold 'q' to quit at any time.")
-    
-    try:
-        while True:
-            # Global quit check
-            if check_quit_key():
-                print("\nQuit signal received.")
-                clear_history()
-                break
-
-            # Check if TTS is currently playing (to avoid listening to self)
-            if tts_engine and tts_engine.is_playing:
-                time.sleep(0.1)
-                continue
+    def filter_text(self, chunk: str) -> str:
+        """
+        Filter out <think> tags from chunks for TTS.
+        Maintains state to handle tags split across chunks.
+        """
+        text = self.filter_buffer + chunk
+        self.filter_buffer = ""
+        
+        filtered = ""
+        i = 0
+        while i < len(text):
+            if self.in_think_block:
+                close_idx = text.find("</think>", i)
+                if close_idx != -1:
+                    self.in_think_block = False
+                    i = close_idx + 8 
+                else:
+                    # Check for partial closing tag at end
+                    partial_found = False
+                    for length in range(1, 8):
+                        suffix = text[-length:]
+                        if "</think>".startswith(suffix):
+                            self.filter_buffer = suffix
+                            partial_found = True
+                            break
+                    break # Discard everything else
+            else:
+                # Not in think block
+                open_idx = text.find("<think>", i)
+                close_idx = text.find("</think>", i)
                 
-            # Record with interrupt check
-            audio_data = recorder.record_until_silence(interrupt_check=check_quit_key)
-            
-            # If aborted
-            if audio_data is None:
-                print("\nQuit signal received during recording.")
-                clear_history()
+                # Handle orphaned </think> by skipping it
+                if close_idx != -1 and (open_idx == -1 or close_idx < open_idx):
+                    filtered += text[i:close_idx]
+                    i = close_idx + 8
+                    continue
+
+                if open_idx != -1:
+                    filtered += text[i:open_idx]
+                    self.in_think_block = True
+                    i = open_idx + 7
+                    continue
+                
+                # Check for partial tags (opening OR closing) at end
+                partial_found = False
+                for length in range(1, 9):
+                    if i + length > len(text): 
+                        # Cannot have a suffix longer than remaining text
+                        continue
+                        
+                    suffix = text[-length:]
+                    # Check if suffix could be start of <think> OR </think>
+                    if "<think>".startswith(suffix) or "</think>".startswith(suffix):
+                        filtered += text[i:-length]
+                        self.filter_buffer = suffix
+                        partial_found = True
+                        break
+                
+                if not partial_found:
+                    filtered += text[i:]
                 break
+                
+        return filtered
+
+    def run(self):
+        """Main execution loop."""
+        clear_history() 
+        
+        print("\n--- Agent Ready ---")
+        print("Press 'q' to quit.")
+        
+        while self.running:
+            if self.check_quit(): break
             
-            if len(audio_data) > 0:
-                process_audio_chunk(audio_data)
+            # Listen
+            audio = self.recorder.record_until_silence(interrupt_check=self.check_quit)
             
-            time.sleep(0.1)
+            if self.check_quit() or audio is None or len(audio) == 0:
+                continue
+
+            # Transcribe
+            print("\rTranscribing...          ", end="", flush=True)
+            try:
+                segments, _ = self.asr_model.transcribe(audio)
+                text = " ".join([s.text for s in segments]).strip()
+                print("\r" + " " * 30 + "\r", end="", flush=True)
+                
+                if not text:
+                    continue
+                    
+                print(f"You: {text}")
+                
+            except Exception as e:
+                print(f"\nASR Error: {e}")
+                continue
+
+            # Response
+            print("Assistant: ", end="", flush=True)
+            self.process_response(text)
+            print("\n")
             
-    except KeyboardInterrupt:
-        print("\nStopping...")
-        clear_history()
+            # Wait for TTS
+            self.wait_for_tts()
+            time.sleep(0.5)
+
+    def process_response(self, user_text):
+        """Get LLM response and feed to TTS."""
+        full_buffer = ""
+        sentence_buffer = ""
+        full_buffer = ""
+        sentence_buffer = ""
+        self.in_think_block = False # Reset state for new turn
+        self.filter_buffer = ""
+        
+        for chunk in get_llm_response(user_text):
+            if self.check_quit(): break
+            
+            # Debug: Check if LLM sends duplicate data
+            # print(f"DEBUG RAW: {repr(chunk)}")
+            
+            clean_chunk = self.filter_text(chunk)
+            
+            if clean_chunk:
+                print(clean_chunk, end="", flush=True)
+                full_buffer += clean_chunk
+                sentence_buffer += clean_chunk
+                
+                if any(p in clean_chunk for p in [".", "?", "!", "\n", ":"]):
+                    if sentence_buffer.strip():
+                        self.tts.synthesize(sentence_buffer)
+                        sentence_buffer = ""
+
+        if sentence_buffer.strip():
+            self.tts.synthesize(sentence_buffer)
+            
+        self.tts.end_turn()
+
+    def wait_for_tts(self):
+        """Block until TTS is done."""
+        if self.tts.is_playing or not self.tts.audio_queue.empty():
+            while self.tts.is_playing or not self.tts.audio_queue.empty():
+                time.sleep(0.1)
+                if self.check_quit():
+                    self.tts.stop()
+                    break
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--file":
-        # Legacy file mode
-        sample_file = os.path.join(current_dir, "audio-transcription", "sampleaudio", "sampleaudio.mp3")
-        output_file = os.path.join(current_dir, "audio-transcription", "asr_output_text.txt")
-        process_pipeline(sample_file, output_file)
-    else:
-        # Default to live mode
-        run_live_loop()
+    agent = VoiceAgent()
+    agent.run()
