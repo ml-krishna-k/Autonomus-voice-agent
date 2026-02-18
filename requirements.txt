@@ -2,15 +2,25 @@
 whisper
 ffmpeg
 faster-whisper
+wenet
 fastapi
 uvicorn
 python-multipart
 imageio-ffmpeg
 
-# Core dependencies
+# Silero VAD dependencies
+torch>=2.0.0
+torchaudio
 numpy
+sounddevice
+librosa
 requests
 python-dotenv
 
-# EasyTurn full-duplex dialogue system dependencies
-scipy>=1.7.0
+# LangChain & LLM dependencies
+langchain-core
+langchain-openai
+pydantic
+
+# TTS dependencies
+

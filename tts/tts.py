@@ -5,7 +5,7 @@ import numpy as np
 import threading
 import queue
 
-class SherpaTTS: # Keeping name to avoid changing main.py, but implementing Piper
+class PiperTTS: # Renamed from SherpaTTS to reflect actual usage
     def __init__(self, model_dir: str):
         self.model_dir = model_dir
         self.audio_queue = queue.Queue()
@@ -16,7 +16,7 @@ class SherpaTTS: # Keeping name to avoid changing main.py, but implementing Pipe
         self.receiving_data = False # Flag to know if we expect more audio chunks
         
         self.piper_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "piper", "piper.exe")
-        self.model_path = os.path.join(model_dir, "en_US-amy-low.onnx")
+        self.model_path = os.path.join(model_dir, "en_US-lessac-medium.onnx")
         
         if not os.path.exists(self.piper_path):
             print(f"Error: Piper not found at {self.piper_path}")
@@ -33,10 +33,9 @@ class SherpaTTS: # Keeping name to avoid changing main.py, but implementing Pipe
 
     def synthesize(self, text: str):
         if not self.valid:
-            print("TTS Invalid state")
             return
 
-        print(f"[TTS] Synthesizing text: '{text[:50]}...'")
+        # print(f"[TTS] Synthesizing text: '{text[:50]}...'")
         try:
             # Run piper
             # output-raw writes raw PCM (s16le) to stdout
@@ -158,3 +157,7 @@ class SherpaTTS: # Keeping name to avoid changing main.py, but implementing Pipe
                 self.audio_queue.get_nowait()
             except queue.Empty:
                 break
+
+    @property
+    def is_busy(self):
+        return not self.audio_queue.empty() or self.is_playing
