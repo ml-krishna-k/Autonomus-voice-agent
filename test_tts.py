@@ -1,10 +1,10 @@
-from tts.tts import SherpaTTS
+from tts.tts import PiperTTS
 import os
 import time
 
 print("Testing pure TTS...")
 models_dir = os.path.join(os.getcwd(), "models")
-tts = SherpaTTS(models_dir)
+tts = PiperTTS(models_dir)
 
 if tts:
     print("Synthesizing...")
