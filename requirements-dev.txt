@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Local microphone / speaker mode (main.py). Not needed in the container —
+# a server has no audio hardware.
+sounddevice>=0.4.6

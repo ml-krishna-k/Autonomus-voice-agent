@@ -1,0 +1,27 @@
+services:
+  agent:
+    build: .
+    image: autonomous-voice-agent:latest
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      LOG_LEVEL: INFO
+      ASR_CPU_THREADS: "4"
+      ASR_MAX_CONCURRENCY: "2"
+      TTS_MAX_CONCURRENCY: "2"
+      HISTORY_MAX_TURNS: "8"
+    deploy:
+      resources:
+        limits:
+          # Below ~2 GB the ASR model plus concurrent synthesis will OOM.
+          memory: 3g
+          cpus: "4"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/readyz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 3

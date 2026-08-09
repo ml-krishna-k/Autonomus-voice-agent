@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Autonomous Voice Agent — Test Client</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36;
+    --text: #e6e9ef; --muted: #8b93a7; --accent: #5b9dff;
+    --user: #4ade80; --agent: #5b9dff; --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #555; flex: none; }
+  .dot.on { background: var(--user); box-shadow: 0 0 8px var(--user); }
+  .dot.speaking { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  .spacer { flex: 1; }
+  button {
+    background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    padding: 7px 14px; border-radius: 7px; cursor: pointer; font-size: 13px;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #07101f; font-weight: 600; }
+  #log { flex: 1; overflow-y: auto; padding: 20px; }
+  .msg { max-width: 680px; margin: 0 0 14px; }
+  .who { font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); margin-bottom: 3px; }
+  .msg.user .who { color: var(--user); }
+  .msg.agent .who { color: var(--agent); }
+  .msg.error { color: var(--err); }
+  .msg.sys { color: var(--muted); font-size: 13px; }
+  footer { border-top: 1px solid var(--line); padding: 12px 20px; display: flex; gap: 10px; }
+  input[type=text] {
+    flex: 1; background: var(--panel); border: 1px solid var(--line);
+    color: var(--text); padding: 9px 12px; border-radius: 7px; font-size: 14px;
+  }
+  input[type=text]:focus { outline: none; border-color: var(--accent); }
+  .meter { width: 90px; height: 5px; background: var(--panel); border-radius: 3px; overflow: hidden; }
+  .meter > i { display: block; height: 100%; width: 0%; background: var(--user); transition: width .06s; }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>Autonomous Voice Agent</h1>
+  <div class="meter"><i id="meter"></i></div>
+  <span class="spacer"></span>
+  <span id="status" style="color:var(--muted);font-size:13px">disconnected</span>
+  <button id="reset">Reset</button>
+  <button id="mic" class="primary">Connect &amp; talk</button>
+</header>
+
+<div id="log"></div>
+
+<footer>
+  <input type="text" id="textIn" placeholder="…or type a message and press Enter" />
+  <button id="send">Send</button>
+</footer>
+
+<script>
+const IN_RATE = 16000;
+
+const els = {
+  log: document.getElementById('log'),
+  dot: document.getElementById('dot'),
+  meter: document.getElementById('meter'),
+  status: document.getElementById('status'),
+  mic: document.getElementById('mic'),
+  reset: document.getElementById('reset'),
+  textIn: document.getElementById('textIn'),
+  send: document.getElementById('send'),
+};
+
+let ws = null, micCtx = null, micStream = null, active = false;
+let playCtx = null, playHead = 0, sources = [];
+let agentLine = null;
+
+function log(text, cls = 'sys', who = null) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + cls;
+  if (who) {
+    const label = document.createElement('div');
+    label.className = 'who';
+    label.textContent = who;
+    div.appendChild(label);
+  }
+  const body = document.createElement('div');
+  body.textContent = text;
+  div.appendChild(body);
+  els.log.appendChild(div);
+  els.log.scrollTop = els.log.scrollHeight;
+  return body;
+}
+
+function setStatus(text) { els.status.textContent = text; }
+
+// ---------- playback -------------------------------------------------------
+
+function ensurePlayCtx(rate) {
+  if (!playCtx || playCtx.sampleRate !== rate) {
+    if (playCtx) playCtx.close();
+    playCtx = new AudioContext({ sampleRate: rate });
+    playHead = 0;
+  }
+  return playCtx;
+}
+
+function enqueueAudio(buffer, rate) {
+  const ctx = ensurePlayCtx(rate);
+  const pcm = new Int16Array(buffer);
+  const audio = ctx.createBuffer(1, pcm.length, rate);
+  const channel = audio.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) channel[i] = pcm[i] / 32768;
+
+  const src = ctx.createBufferSource();
+  src.buffer = audio;
+  src.connect(ctx.destination);
+
+  const now = ctx.currentTime;
+  if (playHead < now) playHead = now + 0.03;
+  src.start(playHead);
+  playHead += audio.duration;
+
+  sources.push(src);
+  src.onended = () => { sources = sources.filter(s => s !== src); };
+}
+
+function stopPlayback() {
+  sources.forEach(s => { try { s.stop(); } catch (_) {} });
+  sources = [];
+  if (playCtx) playHead = playCtx.currentTime;
+}
+
+// ---------- socket ---------------------------------------------------------
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => setStatus('connected');
+  ws.onclose = () => { setStatus('disconnected'); stopMic(); };
+  ws.onerror = () => log('WebSocket error', 'error');
+
+  ws.onmessage = (event) => {
+    if (event.data instanceof ArrayBuffer) {
+      enqueueAudio(event.data, window.__ttsRate || 22050);
+      return;
+    }
+    const msg = JSON.parse(event.data);
+    switch (msg.type) {
+      case 'ready':
+        window.__ttsRate = msg.output_sample_rate;
+        log(`session ${msg.session_id} · in ${msg.input_sample_rate} Hz · out ${msg.output_sample_rate} Hz · barge-in ${msg.barge_in ? 'on' : 'off'}`);
+        break;
+      case 'speech_start':
+        els.dot.className = 'dot speaking';
+        stopPlayback();
+        break;
+      case 'speech_end':
+        els.dot.className = 'dot on';
+        setStatus('transcribing…');
+        break;
+      case 'transcript':
+        log(msg.text, 'user', 'you');
+        setStatus('thinking…');
+        break;
+      case 'no_speech':
+        setStatus('listening');
+        break;
+      case 'response_start':
+        agentLine = log('', 'agent', 'krish');
+        break;
+      case 'token':
+        if (agentLine) agentLine.textContent += msg.text;
+        break;
+      case 'tts_start':
+        window.__ttsRate = msg.sample_rate;
+        setStatus('speaking…');
+        break;
+      case 'tts_cancel':
+        stopPlayback();
+        break;
+      case 'tts_end':
+      case 'response_end':
+        setStatus(active ? 'listening' : 'connected');
+        break;
+      case 'reset_ok':
+        els.log.innerHTML = '';
+        log('conversation reset');
+        break;
+      case 'error':
+        log(msg.message, 'error');
+        setStatus('error');
+        break;
+    }
+  };
+}
+
+// ---------- capture --------------------------------------------------------
+
+const WORKLET = `
+class Capture extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0][0];
+    if (ch) {
+      const pcm = new Int16Array(ch.length);
+      let peak = 0;
+      for (let i = 0; i < ch.length; i++) {
+        const s = Math.max(-1, Math.min(1, ch[i]));
+        pcm[i] = s * 32767;
+        peak = Math.max(peak, Math.abs(s));
+      }
+      this.port.postMessage({ pcm: pcm.buffer, peak }, [pcm.buffer]);
+    }
+    return true;
+  }
+}
+registerProcessor('capture', Capture);
+`;
+
+async function startMic() {
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+
+  micCtx = new AudioContext({ sampleRate: IN_RATE });
+  const url = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
+  await micCtx.audioWorklet.addModule(url);
+  URL.revokeObjectURL(url);
+
+  const source = micCtx.createMediaStreamSource(micStream);
+  const node = new AudioWorkletNode(micCtx, 'capture');
+  node.port.onmessage = (e) => {
+    els.meter.style.width = Math.min(100, e.data.peak * 300) + '%';
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(e.data.pcm);
+  };
+  source.connect(node);
+  // Keep the graph pulling without echoing the mic to the speakers.
+  node.connect(micCtx.createGain()).connect(micCtx.destination);
+
+  active = true;
+  els.dot.className = 'dot on';
+  els.mic.textContent = 'Stop';
+  setStatus('listening');
+}
+
+function stopMic() {
+  active = false;
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+  if (micCtx) micCtx.close();
+  micStream = micCtx = null;
+  els.dot.className = 'dot';
+  els.meter.style.width = '0%';
+  els.mic.textContent = 'Connect & talk';
+}
+
+// ---------- wiring ---------------------------------------------------------
+
+els.mic.onclick = async () => {
+  if (active) { stopMic(); return; }
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    connect();
+    await new Promise(r => ws.addEventListener('open', r, { once: true }));
+  }
+  try { await startMic(); }
+  catch (err) { log('microphone denied: ' + err.message, 'error'); }
+};
+
+els.reset.onclick = () => {
+  stopPlayback();
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'reset' }));
+};
+
+function sendText() {
+  const text = els.textIn.value.trim();
+  if (!text) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) { connect(); return; }
+  stopPlayback();
+  ws.send(JSON.stringify({ type: 'text', text }));
+  els.textIn.value = '';
+}
+
+els.send.onclick = sendText;
+els.textIn.onkeydown = (e) => { if (e.key === 'Enter') sendText(); };
+
+log('Click "Connect & talk" to grant microphone access, or type below to test without audio.');
+</script>
+</body>
+</html>

@@ -1,16 +1,21 @@
-# ASR dependencies
-whisper
-ffmpeg
-faster-whisper
-fastapi
-uvicorn
-python-multipart
-imageio-ffmpeg
+# Runtime dependencies for the hosted service.
+# Local-microphone mode additionally needs: pip install -r requirements-dev.txt
 
-# Core dependencies
-numpy
-requests
-python-dotenv
+# --- Web server ---
+fastapi>=0.115
+uvicorn[standard]>=0.30
+websockets>=12.0
 
-# EasyTurn full-duplex dialogue system dependencies
-scipy>=1.7.0
+# --- LLM transport ---
+httpx>=0.27
+python-dotenv>=1.0
+
+# --- ASR ---
+faster-whisper>=1.0.3
+
+# --- TTS ---
+piper-tts>=1.2.0
+onnxruntime>=1.17
+
+# --- Numerics ---
+numpy>=1.26,<3

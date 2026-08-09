@@ -1,222 +1,187 @@
-import os
+#!/usr/bin/env python
+"""Local microphone mode — the desktop development client.
+
+This talks to the *same* engines the server uses (`app/`), so the VAD, think-tag
+filter, sentence chunker and TTS behave identically to production. The only
+difference is transport: sound card in, sound card out, instead of a WebSocket.
+
+    pip install -r requirements-dev.txt
+    python main.py
+
+For the hosted service, run `uvicorn app.server:app` instead — see README.md.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import queue
 import sys
-import time
-import msvcrt
-import re
-import atexit
-from pathlib import Path
+import threading
 
-# Ensure paths are correct
-sys.path.append(os.path.join(os.path.dirname(__file__), "audio-transcription"))
+import numpy as np
 
-from audio.recorder import AudioRecorder
-# Dynamic import for ASR to handle potential path issues gracefully-ish
+from app.asr import ASREngine
+from app.config import get_settings
+from app.llm import LLMClient
+from app.pipeline import ConversationPipeline
+from app.segmenter import UtteranceSegmenter
+from app.session import SessionStore
+from app.tts import TTSEngine
+
 try:
-    from asr_service.api.asr.model import ASRModel
-except ImportError:
-    try:
-        from asr.model import ASRModel
-    except ImportError:
-        print("Error importing ASRModel. Check paths.")
-        sys.exit(1)
+    import sounddevice as sd
+except ImportError:  # pragma: no cover
+    sys.exit(
+        "sounddevice is not installed.\n"
+        "Local mic mode needs it:  pip install -r requirements-dev.txt"
+    )
 
-from tts.tts import SherpaTTS
-from llm.llm import get_llm_response, clear_history
+log = logging.getLogger("local")
 
-class VoiceAgent:
-    def __init__(self):
-        print("Initializing Autonomous Voice Agent...")
-        self.running = True
-        
-        # 1. Components
-        try:
-            self.recorder = AudioRecorder()
-            print("[OK] Microphone initialized.")
-            
-            self.asr_model = ASRModel()
-            print("[OK] ASR Model loaded.")
-            
-            models_dir = os.path.join(os.path.dirname(__file__), "models")
-            self.tts = SherpaTTS(models_dir)
-            print("[OK] TTS System initialized.")
-            
-        except Exception as e:
-            print(f"[CRITICAL] Initialization failed: {e}")
-            sys.exit(1)
-            
-        # State
-        self.response_buffer = ""
-        self.in_think_block = False
-        self.filter_buffer = ""
 
-        # Register cleanup
-        atexit.register(self.cleanup)
+class Speaker:
+    """Background playback thread with an interruptible queue."""
 
-    def cleanup(self):
-        """Cleanup resources on exit."""
-        print("\nCleaning up resources...")
-        try:
-            clear_history() 
-            if hasattr(self, 'tts'):
-                self.tts.stop()
-        except:
-            pass
+    def __init__(self, sample_rate: int) -> None:
+        self.sample_rate = sample_rate
+        self._queue: queue.Queue[bytes | None] = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
-    def check_quit(self):
-        """Check for 'q' key."""
-        if msvcrt.kbhit():
-            key = msvcrt.getch()
-            if key.lower() == b'q':
-                self.running = False
-                return True
-        return False
+    def play(self, pcm: bytes) -> None:
+        self._queue.put(pcm)
 
-    def filter_text(self, chunk: str) -> str:
-        """
-        Filter out <think> tags from chunks for TTS.
-        Maintains state to handle tags split across chunks.
-        """
-        text = self.filter_buffer + chunk
-        self.filter_buffer = ""
-        
-        filtered = ""
-        i = 0
-        while i < len(text):
-            if self.in_think_block:
-                close_idx = text.find("</think>", i)
-                if close_idx != -1:
-                    self.in_think_block = False
-                    i = close_idx + 8 
-                else:
-                    # Check for partial closing tag at end
-                    partial_found = False
-                    for length in range(1, 8):
-                        suffix = text[-length:]
-                        if "</think>".startswith(suffix):
-                            self.filter_buffer = suffix
-                            partial_found = True
-                            break
-                    break # Discard everything else
-            else:
-                # Not in think block
-                open_idx = text.find("<think>", i)
-                close_idx = text.find("</think>", i)
-                
-                # Handle orphaned </think> by skipping it
-                if close_idx != -1 and (open_idx == -1 or close_idx < open_idx):
-                    filtered += text[i:close_idx]
-                    i = close_idx + 8
-                    continue
-
-                if open_idx != -1:
-                    filtered += text[i:open_idx]
-                    self.in_think_block = True
-                    i = open_idx + 7
-                    continue
-                
-                # Check for partial tags (opening OR closing) at end
-                partial_found = False
-                for length in range(1, 9):
-                    if i + length > len(text): 
-                        # Cannot have a suffix longer than remaining text
-                        continue
-                        
-                    suffix = text[-length:]
-                    # Check if suffix could be start of <think> OR </think>
-                    if "<think>".startswith(suffix) or "</think>".startswith(suffix):
-                        filtered += text[i:-length]
-                        self.filter_buffer = suffix
-                        partial_found = True
-                        break
-                
-                if not partial_found:
-                    filtered += text[i:]
-                break
-                
-        return filtered
-
-    def run(self):
-        """Main execution loop."""
-        clear_history() 
-        
-        print("\n--- Agent Ready ---")
-        print("Press 'q' to quit.")
-        
-        while self.running:
-            if self.check_quit(): break
-            
-            # Listen
-            audio = self.recorder.record_until_silence(interrupt_check=self.check_quit)
-            
-            if self.check_quit() or audio is None or len(audio) == 0:
-                continue
-
-            # Transcribe
-            print("\rTranscribing...          ", end="", flush=True)
+    def flush(self) -> None:
+        """Drop anything not yet played (barge-in)."""
+        while True:
             try:
-                segments, _ = self.asr_model.transcribe(audio)
-                text = " ".join([s.text for s in segments]).strip()
-                print("\r" + " " * 30 + "\r", end="", flush=True)
-                
-                if not text:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def close(self) -> None:
+        self._stop.set()
+        self._queue.put(None)
+        self._thread.join(timeout=3.0)
+
+    def _run(self) -> None:
+        with sd.OutputStream(
+            samplerate=self.sample_rate, channels=1, dtype="int16"
+        ) as stream:
+            while not self._stop.is_set():
+                try:
+                    item = self._queue.get(timeout=0.1)
+                except queue.Empty:
                     continue
-                    
-                print(f"You: {text}")
-                
-            except Exception as e:
-                print(f"\nASR Error: {e}")
-                continue
-
-            # Response
-            print("Assistant: ", end="", flush=True)
-            self.process_response(text)
-            print("\n")
-            
-            # Wait for TTS
-            self.wait_for_tts()
-            time.sleep(0.5)
-
-    def process_response(self, user_text):
-        """Get LLM response and feed to TTS."""
-        full_buffer = ""
-        sentence_buffer = ""
-        full_buffer = ""
-        sentence_buffer = ""
-        self.in_think_block = False # Reset state for new turn
-        self.filter_buffer = ""
-        
-        for chunk in get_llm_response(user_text):
-            if self.check_quit(): break
-            
-            # Debug: Check if LLM sends duplicate data
-            # print(f"DEBUG RAW: {repr(chunk)}")
-            
-            clean_chunk = self.filter_text(chunk)
-            
-            if clean_chunk:
-                print(clean_chunk, end="", flush=True)
-                full_buffer += clean_chunk
-                sentence_buffer += clean_chunk
-                
-                if any(p in clean_chunk for p in [".", "?", "!", "\n", ":"]):
-                    if sentence_buffer.strip():
-                        self.tts.synthesize(sentence_buffer)
-                        sentence_buffer = ""
-
-        if sentence_buffer.strip():
-            self.tts.synthesize(sentence_buffer)
-            
-        self.tts.end_turn()
-
-    def wait_for_tts(self):
-        """Block until TTS is done."""
-        if self.tts.is_playing or not self.tts.audio_queue.empty():
-            while self.tts.is_playing or not self.tts.audio_queue.empty():
-                time.sleep(0.1)
-                if self.check_quit():
-                    self.tts.stop()
+                if item is None:
                     break
+                samples = np.frombuffer(item, dtype="<i2")
+                # Write in slices so flush()/close() can interrupt a long clip.
+                for start in range(0, len(samples), 1024):
+                    if self._stop.is_set():
+                        return
+                    stream.write(samples[start : start + 1024])
+
+
+async def run() -> int:
+    settings = get_settings()
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level, logging.INFO),
+        format="%(levelname)-7s %(name)s | %(message)s",
+    )
+
+    print("Loading models…")
+    asr, tts = ASREngine(settings), TTSEngine(settings)
+    await asyncio.gather(asyncio.to_thread(asr.load), asyncio.to_thread(tts.load))
+
+    llm = LLMClient(settings)
+    await llm.start()
+    if not llm.configured:
+        print("\n! OPENROUTER_API_KEY is not set — copy .env.example to .env first.")
+        return 1
+
+    speaker = Speaker(tts.sample_rate)
+    session = SessionStore(settings).create()
+    loop = asyncio.get_running_loop()
+
+    async def emit(event: dict) -> None:
+        kind = event.get("type")
+        if kind == "token":
+            print(event["text"], end="", flush=True)
+        elif kind == "response_end":
+            print()
+        elif kind == "error":
+            print(f"\n[error] {event['message']}")
+
+    async def emit_audio(pcm: bytes) -> None:
+        speaker.play(pcm)
+
+    pipeline = ConversationPipeline(asr, llm, tts, emit, emit_audio)
+    segmenter = UtteranceSegmenter(
+        sample_rate=settings.input_sample_rate,
+        threshold=settings.vad_threshold,
+        silence_ms=settings.vad_silence_ms,
+        min_speech_ms=settings.vad_min_speech_ms,
+        max_utterance_ms=settings.vad_max_utterance_ms,
+        preroll_ms=settings.vad_preroll_ms,
+    )
+
+    # The audio callback runs on PortAudio's thread; hand frames to the loop.
+    frames: asyncio.Queue[np.ndarray] = asyncio.Queue()
+
+    def on_audio(indata, _frames, _time, status) -> None:
+        if status:
+            log.debug("input status: %s", status)
+        loop.call_soon_threadsafe(frames.put_nowait, indata[:, 0].copy())
+
+    turn: asyncio.Task | None = None
+    print("\n─── Agent ready. Speak, or press Ctrl+C to quit. ───\n")
+
+    stream = sd.InputStream(
+        samplerate=settings.input_sample_rate,
+        channels=1,
+        dtype="float32",
+        blocksize=1024,
+        callback=on_audio,
+    )
+
+    try:
+        with stream:
+            while True:
+                chunk = await frames.get()
+                for event in segmenter.feed(chunk):
+                    if event.speech_started:
+                        if settings.allow_barge_in and turn and not turn.done():
+                            turn.cancel()
+                            speaker.flush()
+                            print("  [interrupted]")
+
+                    if event.utterance is not None:
+                        if turn and not turn.done():
+                            turn.cancel()
+                        result = await asr.transcribe(event.utterance)
+                        if not result.text:
+                            continue
+                        print(f"\nYou: {result.text}\nKrish: ", end="", flush=True)
+                        turn = asyncio.create_task(
+                            pipeline.respond(session, result.text)
+                        )
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if turn and not turn.done():
+            turn.cancel()
+        speaker.close()
+        await llm.aclose()
+        print("\nGoodbye.")
+
+    return 0
+
 
 if __name__ == "__main__":
-    agent = VoiceAgent()
-    agent.run()
+    try:
+        raise SystemExit(asyncio.run(run()))
+    except KeyboardInterrupt:
+        raise SystemExit(0)

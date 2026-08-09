@@ -1,0 +1,21 @@
+# Windows-only Piper binary + espeak data — the container uses the Python
+# bindings and Debian's espeak-ng-data instead.
+piper/
+piper.zip
+
+# Models are fetched during the build, not copied from the host.
+models/
+
+.git/
+.github/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
+*.wav
+*.log
+uv.lock
+README.md
+docker-compose.yml
+Dockerfile
